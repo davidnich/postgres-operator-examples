@@ -1,31 +1,166 @@
 apiVersion: postgres-operator.crunchydata.com/v1beta1
 kind: PostgresCluster
 metadata:
-  name: hippo
+  name: hq
   annotations:
     postgres-operator.crunchydata.com/autoCreateUserSchema: "true"
 spec:
-  postgresVersion: 17
-  users:
-    - name: hippo
-      databases:
-        - zoo
+  postgresVersion: 18
+
   instances:
-    - name: instance1
+    # Primary-preferred instance (AMD nodes)
+    - name: nvme-amd
+      replicas: 2
+      resources:
+        requests:
+          cpu: "4"
+          memory: "32Gi"
+        limits:
+          cpu: "12"
+          memory: "48Gi"
       dataVolumeClaimSpec:
+        storageClassName: nvme-local
         accessModes:
         - "ReadWriteOnce"
         resources:
           requests:
-            storage: 1Gi
+            storage: 500Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - canoe
+                      - dugout
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                postgres-operator.crunchydata.com/cluster: hq
+                postgres-operator.crunchydata.com/instance-set: nvme-amd
+
+    # Replica instance (Intel node)
+    - name: nvme-intel
+      replicas: 1
+      resources:
+        requests:
+          cpu: "4"
+          memory: "32Gi"
+        limits:
+          cpu: "12"
+          memory: "48Gi"
+      dataVolumeClaimSpec:
+        storageClassName: nvme-local
+        accessModes:
+        - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: 500Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - umbrella
+
+  # pgBouncer connection pooling
+  proxy:
+    pgBouncer:
+      replicas: 2
+      service:
+        type: NodePort
+        nodePort: 31432
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+      config:
+        global:
+          pool_mode: transaction
+          max_client_conn: "500"
+          default_pool_size: "20"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  postgres-operator.crunchydata.com/cluster: hq
+                  postgres-operator.crunchydata.com/role: pgbouncer
+
+  service:
+    type: ClusterIP
+
+  patroni:
+    dynamicConfiguration:
+      postgresql:
+        parameters:
+          # Memory - sized for 128GB nodes with 48GB container limit
+          shared_buffers: 12GB
+          effective_cache_size: 36GB
+          work_mem: 512MB
+          maintenance_work_mem: 2GB
+
+          # Connections
+          max_connections: 50
+
+          # NVMe-optimized I/O
+          effective_io_concurrency: "200"
+          random_page_cost: "1.1"
+
+          # WAL / Checkpoints
+          wal_buffers: 64MB
+          min_wal_size: 2GB
+          max_wal_size: 8GB
+          checkpoint_completion_target: "0.9"
+
+          # Parallelism
+          max_parallel_workers_per_gather: "4"
+          max_parallel_workers: "8"
+          max_parallel_maintenance_workers: "4"
+
+          # Logging and timezone
+          log_timezone: Europe/Prague
+          timezone: Europe/Prague
+
+  databaseInitSQL:
+    key: init.sql
+    name: postgres-init-sql
+
+  users:
+    - name: postgres
+    - name: hq
+    - name: vector
+      databases:
+        - vector
+
   backups:
     pgbackrest:
       repos:
       - name: repo1
         volume:
           volumeClaimSpec:
+            storageClassName: nfs-csi-nas
             accessModes:
             - "ReadWriteOnce"
             resources:
               requests:
-                storage: 1Gi
+                storage: 100Gi
+        schedules:
+          full: "0 1 * * 0"
+          differential: "0 1 * * 1-6"
+      global:
+        repo1-retention-full: "14"
+        repo1-retention-full-type: time
